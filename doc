@@ -1,0 +1,1169 @@
+#!/usr/bin/env python3
+"""doc -- index and search a project's documentation tree (docs/).
+
+Forked from the private host tree it grew up in (same index/show/grep/log/
+toc/check design) so a project's own docs get the same low-token lookup
+instead of requiring a full-file read every time. Parser logic is unchanged;
+the bits that only made sense for that one tree (its own doc root, a naming
+check tied to its own hosts) were removed, since they do not apply to a
+project repo.
+
+Distributed from `haselab-net/doc-tool` and meant to be vendored into a
+consuming project as a git submodule at `docs/bin` (see ForHuman.md#install
+in that repo, or the copy at `docs/ForHuman.md` once adopted). Root detection
+below relies on this file living two directories below the docs tree root
+(`docs/bin/doc`), which a submodule checkout satisfies without symlinks.
+
+Nothing here writes: there is no cache or generated index file, a full scan
+of a docs/ tree this size takes a few ms.
+
+The index is GENERATED, never hand-maintained: each document carries its own
+two-line header (an H1 and a `**いつ読むか**:` line) and `doc index` collects
+them. Adding a topic therefore means adding <topic>.md and nothing else -- no
+index file to forget to update. `doc check` enforces the conventions.
+
+One topic is one FILE. A topic that grows past one file becomes a folder whose
+overview is its README.md, with the extra documents beside it; ids flatten the
+path with '-' (docs/billing/design.md -> billing-design), so a document keeps its id
+when it is moved into a folder of related ones. Because ids therefore cannot
+encode a tree, hierarchy is derived from the path -- see ns_of().
+
+Sections are addressed by short id (`workspace#ops`), never by line number,
+because line numbers move when a file is edited. The seven standard section
+names map to fixed ids with no markup in the text; anything else carries an
+explicit `{#id}`.
+"""
+import os
+import re
+import sys
+import unicodedata
+from pathlib import Path
+
+# --- layout -----------------------------------------------------------------
+
+DEFAULT_ROOT = str(Path(__file__).resolve().parent.parent)
+
+# Standard section names -> id. Every topic README uses these names in this
+# order (see `doc show rules`), which is what lets the index route to a section
+# without listing each file's own headings, and lets a reader know the section
+# name before opening the file.
+STD_SECTIONS = [
+    ("使い方", "usage"),
+    ("構成", "arch"),
+    ("構成ファイル一覧", "files"),
+    ("セキュリティ上の要点", "security"),
+    ("運用", "ops"),
+    ("既知の制限", "limits"),
+    ("設計判断の記録", "design"),
+]
+STD_BY_NAME = dict(STD_SECTIONS)
+STD_ORDER = {sid: i for i, (_, sid) in enumerate(STD_SECTIONS)}
+
+WHEN_LABEL = "いつ読むか"
+
+# The changelog is one topic split over many files: CHANGELOG.md owns the
+# namespace from outside it (it has to stay put -- find_root() keys on it) and
+# the dated entries live in CHANGELOG/<chunk>.md.
+CHANGELOG_NS = "CHANGELOG"
+
+# Meta topics (how to write / history / human manual) sort after the real
+# content topics in the index, in this order, so the content is what a reader
+# sees first.
+META_ORDER = {"rules": 1, "ForHuman": 2, "CHANGELOG": 3}
+
+# Output caps. Every command announces truncation on a trailing "#" line -- a
+# silent cap is worse than no cap, because the reader cannot tell whether they
+# saw everything.
+CAP_LOG = 20
+CAP_INDEX_WHEN = 2      # when-line rows in the default index (`doc full` is uncapped)
+CAP_SHOW_LINES = 300
+CAP_GREP_SECTIONS = 20
+CAP_GREP_PER_SECTION = 3
+GREP_WIDTH = 200
+
+ID_RE = re.compile(r"\s*\{#([A-Za-z0-9][A-Za-z0-9._-]*)\}\s*$")
+HEADING_RE = re.compile(r"^(#{1,6}) +(.*?)\s*$")
+FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
+DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+# Relative markdown link, for checking the target still exists after a move.
+LINK_RE = re.compile(r"\]\((\.{1,2}/[^)\s]+)\)")
+# topic#id cross-reference. Ids no longer contain '/', but the topic part still
+# accepts "a/b" so that a leftover slash-form reference is LEXED and can be
+# reported; drop that and the old form becomes invisible instead of wrong.
+# The lookbehind also refuses '.', or "`doc/USERMAN.md#tool`" matches as the
+# nonexistent topic "md" and is silently skipped as unknown; and '{'/'$', or a
+# shell parameter expansion in a recorded command ("${unit#chrome-debug@}")
+# reads as a reference to a topic named "unit".
+REF_RE = re.compile(r"(?<![\w/#.${-])([a-zA-Z][\w-]*(?:/[a-zA-Z0-9][\w-]*)*#[A-Za-z0-9][\w.-]*)")
+
+
+def out(s=""):
+    print(s)
+
+
+def note(s):
+    """A '#'-prefixed line: metadata about the output, not content."""
+    print("# " + s if s else "#")
+
+
+def warn(s):
+    print("# " + s, file=sys.stderr)
+
+
+# --- parsing ----------------------------------------------------------------
+
+class Section:
+    __slots__ = ("doc", "level", "title", "sid", "start", "end", "parent")
+
+    def __init__(self, doc, level, title, sid, start):
+        self.doc = doc
+        self.level = level
+        self.title = title
+        self.sid = sid
+        self.start = start          # 1-based, the heading line itself
+        self.end = start            # filled in later
+        self.parent = None
+
+    @property
+    def ref(self):
+        return "%s#%s" % (self.doc.topic, self.sid)
+
+    @property
+    def where(self):
+        return "%s:%d-%d" % (self.doc.rel, self.start, self.end)
+
+    def text(self):
+        return self.doc.lines[self.start - 1:self.end]
+
+    def nlines(self):
+        return self.end - self.start + 1
+
+
+class Doc:
+    def __init__(self, root, path):
+        self.path = path
+        self.rel = str(path.relative_to(root))
+        self.lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
+        while self.lines and self.lines[-1] == "":
+            self.lines.pop()
+        self.topic = topic_id(self.rel)
+        # The namespace this file OWNS, and the only thing hierarchy is derived
+        # from. It cannot be derived from the id: ids are flattened with '-', so
+        # "admin-group" is indistinguishable from a hypothetical "admin/group.md".
+        # A folder's overview is its README.md, so that file owns the folder.
+        self.ns = ns_of(self.rel)
+        # Which lines sit inside a fenced block. `doc check` needs it to tell a
+        # real cross-reference from one quoted inside an example or a transcript.
+        self.fenced = [False] * len(self.lines)
+        self.sections = []
+        self.title = ""
+        self.when = ""
+        self.aggregated = False  # set True by load_all() for docs pulled in from a submodule
+        self._parse()
+
+    def _parse(self):
+        in_fence = False
+        fence_line = 0
+        heads = []  # (level, title, sid_explicit, lineno)
+        for i, line in enumerate(self.lines, 1):
+            if FENCE_RE.match(line):
+                if not in_fence:
+                    fence_line = i
+                in_fence = not in_fence
+                self.fenced[i - 1] = True
+                continue
+            if in_fence:
+                self.fenced[i - 1] = True
+                continue
+            # Column 0 only: an indented '#' inside a list is prose, and a '#'
+            # inside a fenced block is a shell comment (there are 170+ of those
+            # in this tree -- without fence tracking they'd become sections).
+            m = HEADING_RE.match(line)
+            if not m or line[0] != "#":
+                continue
+            level = len(m.group(1))
+            title = m.group(2)
+            explicit = None
+            mid = ID_RE.search(title)
+            if mid:
+                explicit = mid.group(1)
+                title = title[:mid.start()].rstrip()
+            heads.append((level, title, explicit, i))
+
+        if in_fence:
+            # Degraded output beats no output: rescan ignoring fences.
+            warn("warning: unclosed code fence in %s at line %d -- headings "
+                 "inside fenced blocks may be misread" % (self.rel, fence_line))
+            # Fence tracking is untrustworthy now, so claim nothing is fenced
+            # rather than mark the whole tail of the file as an example.
+            self.fenced = [False] * len(self.lines)
+            heads = []
+            for i, line in enumerate(self.lines, 1):
+                m = HEADING_RE.match(line)
+                if m and line[0] == "#":
+                    title = m.group(2)
+                    explicit = None
+                    mid = ID_RE.search(title)
+                    if mid:
+                        explicit = mid.group(1)
+                        title = title[:mid.start()].rstrip()
+                    heads.append((len(m.group(1)), title, explicit, i))
+
+        used = {}
+        for idx, (level, title, explicit, ln) in enumerate(heads):
+            if level == 1 and not self.title:
+                self.title = title
+                continue
+            sid = explicit or STD_BY_NAME.get(title) or auto_id(self, title, ln, used)
+            if sid in used:
+                sid = uniq(sid, used)
+            used[sid] = True
+            sec = Section(self, level, title, sid, ln)
+            # A section ends just before the next heading of its own level or
+            # shallower; the last one ends at the file's last non-empty line.
+            end = len(self.lines)
+            for l2, _t2, _e2, ln2 in heads[idx + 1:]:
+                if l2 <= level:
+                    end = ln2 - 1
+                    break
+            while end > ln and not self.lines[end - 1].strip():
+                end -= 1
+            sec.end = end
+            self.sections.append(sec)
+
+        for i, sec in enumerate(self.sections):
+            for prev in reversed(self.sections[:i]):
+                if prev.level < sec.level:
+                    sec.parent = prev
+                    break
+
+        self.when = self._find_when()
+
+    def _find_when(self):
+        """The `**いつ読むか**: ...` line (plus its continuation lines) that
+        each topic README carries under its H1. This is the one piece of index
+        data that cannot be generated -- it says when a reader needs the file.
+
+        Fenced blocks are skipped: `rules` shows the topic template (which
+        contains a literal `**いつ読むか**:` placeholder) inside a fence, and
+        without this the placeholder becomes that topic's index entry."""
+        pat = re.compile(r"^\*\*%s\*\*\s*[:：]\s*(.*)$" % re.escape(WHEN_LABEL))
+        limit = min(len(self.lines), 40)
+        in_fence = False
+        for i in range(limit):
+            if FENCE_RE.match(self.lines[i]):
+                in_fence = not in_fence
+                continue
+            if in_fence:
+                continue
+            m = pat.match(self.lines[i])
+            if not m:
+                continue
+            parts = [m.group(1).strip()]
+            for cont in self.lines[i + 1:limit]:
+                if not cont.strip() or cont.startswith(("#", ">", "|", "```")):
+                    break
+                parts.append(cont.strip())
+            return " ".join(p for p in parts if p)
+        return ""
+
+    def find(self, sid):
+        for s in self.sections:
+            if s.sid == sid:
+                return s
+        return None
+
+
+def ns_of(rel):
+    """The namespace a file owns. A folder's overview is its README.md, so that
+    file owns the folder itself; every other file owns its own path.
+
+      billing/README.md           -> billing       (owns the folder)
+      billing/design.md           -> billing/design
+      admin-group.md              -> admin-group
+      CHANGELOG.md                -> CHANGELOG     (owns CHANGELOG/, from outside it)
+      CHANGELOG/006.md            -> CHANGELOG/006
+      README.md                   -> README        (the tree root's own README owns
+                                                    nothing -- every top-level file
+                                                    would otherwise be its child)
+
+    X.md and X/README.md both own X, so only one of the two may exist;
+    `doc check` reports the pair as a duplicate topic id.
+    """
+    stem = rel[:-3] if rel.endswith(".md") else rel
+    d, _, base = stem.rpartition("/")
+    return d if (base == "README" and d) else stem
+
+
+def topic_id(rel):
+    """One id per FILE, not per directory -- a topic that splits its rationale
+    into <topic>/design.md needs its own id and its own index row, or the two
+    files collide and `doc show <topic>` becomes ambiguous.
+
+    The id is the owned namespace (see ns_of) with '/' flattened to '-', at any
+    depth. Ids therefore never contain '/', which is why hierarchy has to come
+    from the path instead.
+
+      billing/README.md                  -> billing
+      billing/design.md                  -> billing-design
+      web/deploy.md                      -> web-deploy
+      CHANGELOG/006.md                   -> CHANGELOG-006
+      overview/space/README.md           -> overview-space
+      overview/space/terrace.md          -> overview-space-terrace
+      README.md                          -> rules   (tree's own README is the writing rules)
+      CHANGELOG.md                       -> CHANGELOG
+    """
+    stem = rel[:-3] if rel.endswith(".md") else rel
+    if "/" not in stem:
+        return "rules" if stem == "README" else stem
+    d, base = stem.rsplit("/", 1)
+    ns = d if base == "README" else "%s/%s" % (d, base.lower())
+    return ns.replace("/", "-")
+
+
+def auto_id(doc, title, ln, used):
+    """Id for a heading that is neither standard nor explicitly tagged.
+    CHANGELOG entries key off their date (which is NOT unique here -- 12 entries
+    share 2026-07-24 -- so duplicates get -2, -3 ...); anything else falls back
+    to its line, which at least always resolves."""
+    m = DATE_RE.match(title)
+    if m:
+        return m.group(1)
+    slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")
+    if slug and len(slug) >= 3 and re.match(r"^[a-z]", slug):
+        return slug[:40]
+    return "L%d" % ln
+
+
+def uniq(sid, used):
+    n = 2
+    while "%s-%d" % (sid, n) in used:
+        n += 1
+    return "%s-%d" % (sid, n)
+
+
+def load(root):
+    docs = []
+    for p in sorted(root.rglob("*.md")):
+        if "bin" in p.relative_to(root).parts:
+            continue
+        docs.append(Doc(root, p))
+    return docs
+
+
+def discover_submodule_roots(root):
+    """root.parent/.gitmodules を見て、自分の docs/CHANGELOG.md を持つ
+    submodule だけを子root として返す。doc-tool自身のsubmodule(通常 docs/bin)
+    は下に docs/CHANGELOG.md が無いので自然に無視される。"""
+    gm = root.parent / ".gitmodules"
+    if not gm.exists():
+        return []
+    name, out = None, []
+    for line in gm.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = line.strip()
+        m = re.match(r'\[submodule "(.*)"\]', line)
+        if m:
+            name = m.group(1)
+            continue
+        m = re.match(r'path\s*=\s*(.+)', line)
+        if m and name:
+            child = root.parent / m.group(1).strip() / "docs"
+            if (child / "CHANGELOG.md").exists():
+                out.append((name, child))
+            name = None
+    return out
+
+
+def load_all(root):
+    """load(root) に、検出した子rootのdocsを足したもの。子root側は
+    load(child_root) をそのまま再利用するので、子リポジトリ単体で `doc` を
+    動かしたときの topic id と完全に一致する -- rules/ForHuman/CHANGELOG は
+    子リポジトリ内だけの話なので集約対象から外す(子の日付履歴を親の `doc log`
+    に混ぜない、という判断)。取り込んだ残りは既存の `<dir>-<file>` 命名規則に
+    揃えてフラットな topic id にする(例: architecture -> myproject-architecture)。"""
+    docs = load(root)
+    for name, child_root in discover_submodule_roots(root):
+        for d in load(child_root):
+            if d.topic in ("rules", "ForHuman", "CHANGELOG"):
+                continue
+            d.topic = "%s-%s" % (name, d.topic.replace("/", "-"))
+            d.rel = str(d.path.relative_to(root.parent))
+            # ns was computed against the submodule's own root, so it no longer
+            # describes where this doc sits in the tree being displayed. These
+            # are presented flat, so make the namespace match the flat id.
+            d.ns = d.topic
+            d.aggregated = True
+            docs.append(d)
+    return docs
+
+# --- hierarchy (from paths, never from ids) ---------------------------------
+
+def owner_ns(docs, ns):
+    """The namespace of the nearest ancestor folder that actually owns a
+    document. A folder with no README.md of its own owns nothing, has no id and
+    gets no index row, so it is walked straight through -- otherwise everything
+    under it would attach to a parent that is never displayed, and become
+    unreachable from the default view."""
+    owned = {d.ns for d in docs}
+    p = ns.rpartition("/")[0]
+    while p and p not in owned:
+        p = p.rpartition("/")[0]
+    return p
+
+
+def top_level(docs):
+    return [d for d in docs if not owner_ns(docs, d.ns)]
+
+
+def children_of(docs, ns):
+    return sorted((d for d in docs if d.ns != ns and owner_ns(docs, d.ns) == ns),
+                  key=lambda d: d.ns)
+
+
+def descendants_of(docs, ns):
+    return [d for d in docs if d.ns.startswith(ns + "/")]
+
+
+def meta_rank(docs, d):
+    """META_ORDER, looked up on the TOP-LEVEL ancestor rather than on the doc
+    itself -- keyed on its own id a CHANGELOG chunk ranks 0 and would sort
+    above its own parent, which ranks 3."""
+    root_ns = d.ns.split("/", 1)[0]
+    anc = next((x for x in docs if x.ns == root_ns), None)
+    return META_ORDER.get(anc.topic if anc else root_ns, 0)
+
+
+def find_root():
+    env = os.environ.get("DOC_ROOT")
+    if env:
+        return Path(env)
+    here = Path(__file__).resolve().parent.parent
+    if (here / "CHANGELOG.md").exists():
+        return here
+    return Path(DEFAULT_ROOT)
+
+
+# --- matching ---------------------------------------------------------------
+
+def norm(s):
+    # NFKC so full-width alphanumerics (which do appear in these docs) match
+    # their half-width form. Raw text is always what gets printed.
+    return unicodedata.normalize("NFKC", s)
+
+
+def compile_pat(pattern, fixed=False, case_sensitive=False):
+    flags = 0 if case_sensitive else re.IGNORECASE
+    p = norm(pattern)
+    if fixed:
+        return re.compile(re.escape(p), flags)
+    try:
+        return re.compile(p, flags)
+    except re.error:
+        # LLMs paste headings containing (2), backticks, brackets. Turning a
+        # crash into the obviously-intended literal search is strictly better.
+        warn("note: not a valid regex, matched literally (-F)")
+        return re.compile(re.escape(p), flags)
+
+
+# Deliberately never \b: Python's \w includes kana and kanji, so a word
+# boundary against Japanese text succeeds or fails unpredictably.
+
+# --- commands ---------------------------------------------------------------
+
+PROTOCOL = [
+    "1. 下の一覧から当たりを付け、`doc show <topic>#<節ID>` で必要な節だけ読む",
+    "2. 標準節IDは全 topic 共通: usage arch files security ops limits design",
+    "3. 「いつ・どのコマンドで変わったか」だけ CHANGELOG:"
+    " `doc log <語>` が出す id をそのまま `doc show <ID>` へ",
+    "4. 出力の `パス:開始-終了` を Read の offset/limit に渡し、その範囲だけ読む",
+    "5. 一覧にも該当節にも無ければ未文書化。憶測で埋めず実物を確認してから追記する",
+    "   (書き方のルール: `doc show rules`)",
+]
+
+
+def wrap(text, width, indent, maxlines=0):
+    words, lines, cur = text.split(" "), [], ""
+    for w in words:
+        if cur and dwidth(cur) + dwidth(w) + 1 > width:
+            lines.append(cur)
+            cur = w
+        else:
+            cur = (cur + " " + w) if cur else w
+    if cur:
+        lines.append(cur)
+    if maxlines and len(lines) > maxlines:
+        # The default index is what a reader is told to read in full, so one
+        # when-line that enumerates a dozen firing conditions must not eat the
+        # whole budget. `doc full` prints the same text uncapped.
+        lines = lines[:maxlines]
+        lines[-1] += " …"
+    return ("\n" + indent).join(lines)
+
+
+def dwidth(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def pad(s, n):
+    return s + " " * max(0, n - dwidth(s))
+
+
+def cmd_index(root, docs, args):
+    """Top-level topics only. A topic with subtopics says so with a bare
+    count -- not by inlining their when-lines here, which just re-shows what
+    `doc show <topic>` / `doc toc <topic>` already surface on that topic
+    itself (see direct_children()). Keeps this default view low-token; the
+    full nested tree is `doc full`, for humans scanning the whole project."""
+    note("%s — 探し方" % root)
+    for line in PROTOCOL:
+        note(" " + line)
+    out()
+    top = top_level(docs)
+    ordered = sorted(top, key=lambda d: (meta_rank(docs, d), d.topic))
+    tw = max(14, max(dwidth(d.topic) for d in ordered) + 2)
+    ind = " " * (tw + 2)
+    for d in ordered:
+        title = d.title or d.rel
+        # "billing — 説明" / "billing: 説明" -> drop the redundant leading topic name
+        for sep in (" — ", " - ", ": "):
+            pre = d.topic + sep
+            if title.startswith(pre):
+                title = title[len(pre):]
+                break
+        # Name the children instead of counting them. A count costs the same
+        # line and tells the reader nothing, and a child that never appears
+        # anywhere in the default view is invisible to anyone who reads only
+        # this -- `billing-design` says "read this before changing anything".
+        kids = children_of(docs, d.ns)
+        sub = (" → " + " ".join(k.ns.rsplit("/", 1)[-1] for k in kids)) if kids else ""
+        out("%s%s  [%dL%s]" % (pad(d.topic, tw), title, len(d.lines), sub))
+        if d.when:
+            out(ind + "→ " + wrap(d.when, 74, ind + "  ", CAP_INDEX_WHEN))
+        elif d.topic != "rules":
+            out(ind + "→ (**%s** 未記載 — `doc check` 参照)" % WHEN_LABEL)
+    note("`→` の後は子文書。id は `<topic>-<名前>`(例 `billing-design`)。"
+         "`…` は途中省略 — 全文と全階層は `doc full`")
+    return 0
+
+
+def cmd_full(root, docs, args):
+    """The complete nested tree in one shot -- for a human scanning the whole
+    project, not the per-lookup agent flow `doc`/`doc show` are tuned for."""
+    note("%s — 全ツリー索引" % root)
+    out()
+    # Tuple-of-path-segments sort gives a correct depth-first pre-order tree
+    # walk for free: a parent's tuple is always a strict prefix of (and so
+    # sorts immediately before) each of its descendants', and a sibling whose
+    # name happens to prefix another ("space" vs "space-design") still sorts
+    # after everything nested under the shorter one, because the mismatch is
+    # caught at that shared position regardless of what follows it.
+    ordered = sorted(docs, key=lambda d: (meta_rank(docs, d),
+                                          tuple(d.ns.split("/"))))
+    labels = {d.topic: "  " * d.ns.count("/") + d.ns.rsplit("/", 1)[-1] for d in ordered}
+    tw = max(14, max(dwidth(l) for l in labels.values()) + 2)
+    ind = " " * (tw + 2)
+    for d in ordered:
+        title = d.title or d.rel
+        for sep in (" — ", " - ", ": "):
+            pre = d.topic + sep
+            if title.startswith(pre):
+                title = title[len(pre):]
+                break
+        out("%s%s  [%dL]" % (pad(labels[d.topic], tw), title, len(d.lines)))
+        if d.when:
+            out(ind + "→ " + wrap(d.when, 74, ind + "  "))
+        elif d.topic != "rules":
+            out(ind + "→ (**%s** 未記載 — `doc check` 参照)" % WHEN_LABEL)
+    return 0
+
+
+def cmd_toc(root, docs, args):
+    targets = resolve_docs(docs, args.args)
+    if not targets:
+        for n in args.args:
+            kids = resolve_dir(docs, n)
+            if kids:
+                note("%s/ — 概要ファイルの無い名前空間。子文書のみ" % n.rstrip("/"))
+                for k in kids:
+                    out("  %s  %s" % (pad(k.topic, 24), k.title or k.rel))
+                return 0
+        warn("no such topic: %s" % " ".join(args.args))
+        return 1
+    for d in targets:
+        note("%s — %d 行, %d 節" % (d.rel, len(d.lines), len(d.sections)))
+        shown = [s for s in d.sections if not (args.depth and s.level > args.depth + 1)]
+        rw = max([dwidth(s.ref) for s in shown] or [1]) + 2
+        for s in shown:
+            out("  %-11s H%d  %s%s" % ("%d-%d" % (s.start, s.end), s.level,
+                                       pad(s.ref, rw), s.title))
+        kids = direct_children(docs, d)
+        if kids:
+            note("子トピック: " + ", ".join(kids))
+    return 0
+
+
+def changelog_docs(docs):
+    """CHANGELOG.md plus every doc under CHANGELOG/, oldest file first."""
+    own = [d for d in docs if d.ns == CHANGELOG_NS]
+    return own + sorted(descendants_of(docs, CHANGELOG_NS), key=lambda d: d.rel)
+
+
+def changelog_entries(docs):
+    """Only the DATED H2s are entries -- `## チャンク一覧` and the like are not,
+    and counting them made `doc log` report 2 entries for a tree that had 113.
+
+    Order is (file, line) and never a sort by date: many entries share a date,
+    a chunk boundary can fall inside one day, and even the same-day "(2)"
+    labels are not guaranteed unique. Sorting by date would silently reorder
+    all of those, so the file order is authoritative and `doc check` verifies
+    that it is chronological -- a misfiled entry gets reported, not hidden."""
+    return [s for d in changelog_docs(docs)
+            for s in d.sections if s.level == 2 and DATE_RE.match(s.title)]
+
+
+def cmd_log_chunks(docs, cls):
+    """Per-chunk entry count and date range, computed from the files. The tree
+    used to carry these by hand in three places (a table, each chunk's H1, and
+    a list of ids) and all three drifted apart; `doc check` now forbids writing
+    them down at all."""
+    for d in cls:
+        es = [x for x in d.sections if x.level == 2 and DATE_RE.match(x.title)]
+        if not es and d.ns == CHANGELOG_NS:
+            continue        # the overview file itself holds no entries
+        dates = [DATE_RE.match(x.title).group(1) for x in es]
+        rng = "%s 〜 %s" % (dates[0], dates[-1]) if dates else "(エントリ無し)"
+        out("  %s  %4d件  %s" % (pad(d.topic, 18), len(es), rng))
+    note("本文は `doc show <ID>`、エントリ一覧は `doc log`")
+    return 0
+
+
+def cmd_log(root, docs, args):
+    cls = changelog_docs(docs)
+    if not cls:
+        warn("CHANGELOG.md not found under %s" % root)
+        return 2
+    if args.chunks:
+        return cmd_log_chunks(docs, cls)
+    entries = changelog_entries(docs)
+    pat = compile_pat(args.args[0], args.fixed, args.case_sensitive) if args.args else None
+    if pat:
+        entries = [e for e in entries
+                   if pat.search(norm(e.title)) or pat.search(norm("\n".join(e.text())))]
+    if not entries:
+        note("no matching entries")
+        return 1
+    entries = list(reversed(entries)) if not args.oldest_first else entries
+    limit = len(entries) if args.n == 0 else min(args.n, len(entries))
+    note("CHANGELOG — %d 件%s (%d ファイル)。%s、%d 件表示" % (
+        len(entries), " (一致)" if pat else "", len(cls),
+        "古い順" if args.oldest_first else "新しい順", limit))
+    rw = max([dwidth(e.ref) for e in entries] or [1]) + 2
+    for e in entries[:limit]:
+        m = DATE_RE.match(e.title)
+        date = m.group(1) if m else ""
+        title = e.title
+        if date:
+            # "2026-08-01(2) — 表題" -> "表題"; the (2) only disambiguates the
+            # date, and the entry's own {#id} in e.ref already carries that.
+            title = re.sub(r"^\s*\(\d+\)", "", title[len(date):]).lstrip(" —-")
+        out("  %s  %5s  %-13s %s" % (pad(e.ref, rw), "%dL" % e.nlines(), date, title))
+    if limit < len(entries):
+        note("あと %d 件。`doc log <語>` で絞るか `-n 0` で全件" % (len(entries) - limit))
+    note("本文は `doc show <ID>`")
+    return 0
+
+
+def section_children(p):
+    """Direct next-level-down sections under a picked Doc or Section -- what
+    cmd_show falls back to listing when p itself is too big to show whole
+    and there's still something more specific to narrow into. A Doc's own
+    top-level sections have no .parent (the H1 line becomes the doc's title,
+    never a Section, so nothing precedes them at a shallower level); a
+    Section's children are exactly the ones whose nearest shallower-level
+    ancestor is p itself (computed once, in Doc._parse())."""
+    if isinstance(p, Section):
+        return [s for s in p.doc.sections if s.parent is p]
+    return [s for s in p.sections if s.parent is None]
+
+
+def cmd_show(root, docs, args):
+    if not args.args:
+        warn("usage: doc show <topic>#<id> | <topic> ...")
+        return 2
+    picked, missing = [], []
+    for a in args.args:
+        if "#" in a:
+            t, sid = a.split("#", 1)
+            d = next((x for x in docs if x.topic == t), None)
+            if d is None and "/" in t:
+                # Slash-form ids are gone. Resolve to the dash form here rather
+                # than only rejecting it, or a stale reference costs the reader a
+                # search to find out what replaced it.
+                alt = t.replace("/", "-")
+                d = next((x for x in docs if x.topic == alt), None)
+                if d is not None:
+                    warn("`%s` は旧形式。id は `%s#%s`" % (a, alt, sid))
+            s = d.find(sid) if d else None
+            if s is None:
+                missing.append(a)
+            else:
+                picked.append(s)
+        else:
+            ds = resolve_docs(docs, [a])
+            if not ds:
+                missing.append(a)
+            picked.extend(ds)
+    for a in missing:
+        warn("not found: %s" % a)
+    if not picked:
+        return 1
+
+    cap = args.max_lines
+    # Decided per picked item, not once for the whole request: an item with
+    # nothing finer to narrow into (a leaf section, or -- degenerately -- a
+    # one-section doc) is shown in full regardless of size, since capping it
+    # would just force the exact same request again with a raised
+    # --max-lines. An item that itself still breaks down further (a whole
+    # multi-section topic, or a section with its own nested sub-sections)
+    # degrades to a listing of exactly the next level down when it's over
+    # the cap -- e.g. a huge H2 "節" lists its H3 sub-sections instead of
+    # dumping all of them concatenated, the same way a huge topic already
+    # listed its own top-level sections.
+    for p in picked:
+        nlines = p.nlines() if isinstance(p, Section) else len(p.lines)
+        kids = section_children(p)
+        if cap and nlines > cap and kids:
+            # Never truncate mid-section: degrade to a list the caller can
+            # pick from instead -- self-evidently a listing by its own
+            # format (id / size / title columns, not prose), the same as
+            # every other listing this tool prints (the bare index, grep,
+            # toc), none of which announce themselves either.
+            if isinstance(p, Section):
+                out("  %s  %s  %s" % (pad(p.ref, 30), pad("%dL" % nlines, 6), p.title))
+            else:
+                out("  %s  %s  %s" % (pad(p.topic, 30), pad("%dL" % nlines, 6),
+                                      p.title or p.rel))
+                topic_kids = direct_children(docs, p)
+                if topic_kids:
+                    out("      子トピック: " + ", ".join(topic_kids))
+            for s in kids:
+                out("      %s  %s" % (pad(s.ref, 26), s.title))
+            continue
+
+        if isinstance(p, Section):
+            note("%s  (%s, %d 行)  %s" % (p.ref, p.where, nlines, p.title))
+            for line in p.text():
+                out(line)
+            note("end %s" % p.ref)
+        else:
+            note("%s  (%s, %d 行)" % (p.topic, p.rel, nlines))
+            topic_kids = direct_children(docs, p)
+            if topic_kids:
+                note("子トピック: " + ", ".join(topic_kids))
+            for line in p.lines:
+                out(line)
+            note("end %s" % p.topic)
+    return 0
+
+
+def cmd_grep(root, docs, args):
+    if not args.args:
+        warn("usage: doc grep <pattern>")
+        return 2
+    pat = compile_pat(args.args[0], args.fixed, args.case_sensitive)
+    sel = topic_filter(docs, args.topic) if args.topic else None
+
+    hits = []       # (section_or_none, doc, [(lineno, text)])
+    nfiles = set()
+    for d in docs:
+        if sel is not None and d not in sel:
+            continue
+        bysec = {}
+        for i, line in enumerate(d.lines, 1):
+            if not pat.search(norm(line)):
+                continue
+            sec = section_at(d, i)
+            bysec.setdefault(id(sec) if sec else 0, (sec, []))[1].append((i, line))
+        for _k, (sec, ls) in bysec.items():
+            hits.append((sec, d, ls))
+            nfiles.add(d.rel)
+    if not hits:
+        note("no match")
+        return 1
+
+    nmatch = sum(len(ls) for _s, _d, ls in hits)
+    note("%s — %d 箇所 / %d 節 / %d ファイル" % (root, nmatch, len(hits), len(nfiles)))
+    if args.files_only:
+        per = {}
+        for _s, d, ls in hits:
+            per[d.rel] = per.get(d.rel, 0) + len(ls)
+        for rel, n in sorted(per.items(), key=lambda kv: -kv[1]):
+            out("  %s  %d 箇所" % (pad(rel, 34), n))
+        return 0
+
+    hits.sort(key=lambda h: (-len(h[2]), h[1].rel))
+    for sec, d, ls in hits[:args.max_sections]:
+        if sec is None:
+            out("%s:1-%d  --  (見出しの外)" % (d.rel, len(d.lines)))
+        else:
+            crumb = ("%s › %s" % (sec.parent.title, sec.title)) if sec.parent else sec.title
+            out("%s  %s  H%d  %s" % (pad(sec.where, 26), pad(sec.ref, 26), sec.level, crumb))
+        for ln, text in ls[:args.per_section]:
+            t = text.strip()
+            if dwidth(t) > args.width:
+                t = t[:args.width] + "…"
+            out("   %5d: %s" % (ln, t))
+        if len(ls) > args.per_section:
+            note("  この節にあと %d 箇所" % (len(ls) - args.per_section))
+    if len(hits) > args.max_sections:
+        note("あと %d 節。`--max-sections 0` か `--files-only`、または絞り込みを"
+             % (len(hits) - args.max_sections))
+    note("上の行範囲を Read の offset/limit に渡すこと。ファイル全体を読まない")
+    return 0
+
+
+def cmd_check(root, docs, args):
+    problems = []
+
+    def bad(rel, msg):
+        problems.append("%s: %s" % (rel, msg))
+
+    known_ids = set()
+    for d in docs:
+        for s in d.sections:
+            known_ids.add("%s#%s" % (d.topic, s.sid))
+    topic_names = {x.topic for x in docs}
+
+    # topic id collisions across different files. Ids flatten '/' to '-', so
+    # "X-Y.md" and "X/Y.md" are two paths for one id, and so are "X.md" and
+    # "X/README.md" -- either pair would silently alias and `doc show <topic>`
+    # would only ever reach one of them. This is the ONLY guard on id
+    # uniqueness now that ids cannot be inverted back to a path: do not weaken it.
+    by_topic = {}
+    for d in docs:
+        by_topic.setdefault(d.topic, []).append(d.rel)
+    for t, rels in sorted(by_topic.items()):
+        if len(rels) > 1:
+            for rel in rels:
+                others = ", ".join(r for r in rels if r != rel)
+                bad(rel, "topic id '%s' が重複(%s と衝突)" % (t, others))
+
+    for d in docs:
+        if d.topic in ("rules", "CHANGELOG"):
+            pass
+        elif not d.title:
+            bad(d.rel, "H1 が無い(索引の表題になる)")
+        if d.topic != "rules" and not d.when:
+            bad(d.rel, "`**%s**:` 行が無い(索引に載らない)" % WHEN_LABEL)
+
+        # A folder whose only document is its README.md is a folder for nothing:
+        # the overview belongs at the top level as <topic>.md, one level up.
+        if d.ns and "/" not in d.ns and d.rel.endswith("/README.md"):
+            if not children_of(docs, d.ns):
+                bad(d.rel, "文書が1つならフォルダを作らない — `%s.md` へ移す" % d.ns)
+        # Nested basenames are lowercased into the id, so an uppercase one makes
+        # the id stop being readable straight off the path.
+        base = d.rel.rsplit("/", 1)[-1][:-3]
+        if "/" in d.rel and base != "README" and base != base.lower():
+            bad(d.rel, "入れ子のファイル名は小文字(id は '%s' になる)" % d.topic)
+
+        # standard section order
+        seen = [s for s in d.sections if s.level == 2 and s.sid in STD_ORDER]
+        order = [STD_ORDER[s.sid] for s in seen]
+        if order != sorted(order):
+            bad(d.rel, "標準節の順序が規約と違う: %s" % " ".join(s.sid for s in seen))
+        if seen and seen[-1].sid != "design" and any(s.sid == "design" for s in seen):
+            bad(d.rel, "`design`(設計判断の記録)が最後にない")
+
+        # H2 sections that are neither standard nor tagged
+        for s in d.sections:
+            if s.level == 2 and s.sid not in STD_ORDER and not ID_RE.search(
+                    d.lines[s.start - 1]) and not DATE_RE.match(s.title):
+                bad(d.rel, "L%d 節 '%s' に {#id} が無い(行番号でしか指せない)"
+                    % (s.start, s.title))
+
+        # duplicate ids
+        ids = [s.sid for s in d.sections]
+        for sid in sorted(set(x for x in ids if ids.count(x) > 1)):
+            bad(d.rel, "節ID '%s' が重複" % sid)
+
+        # cross references that point nowhere. Skipped for docs pulled in from a
+        # submodule (d.aggregated): a bare `CHANGELOG#id` inside such a doc is
+        # correct in its own tree, but `CHANGELOG` also happens to name the
+        # parent's own (unrelated) topic once merged, so global resolution here
+        # would misjudge it as dangling. That doc's own `doc check`, run inside
+        # its own repo, is the authority on its internal references.
+        if d.aggregated:
+            continue
+        for i, line in enumerate(d.lines, 1):
+            for m in REF_RE.finditer(line):
+                ref = m.group(1)
+                if ref.split("#")[0] in ("http", "https"):
+                    continue
+                # Nested topic ids can look like the tail of a URL path
+                # ("...github.com/foo#bar"). Skip if the run of non-whitespace
+                # characters right before the match traces back to "://".
+                prefix = line[:m.start()]
+                tail = prefix.rsplit(None, 1)[-1] if prefix.strip() else ""
+                if "://" in tail:
+                    continue
+                t, sid = ref.split("#", 1)
+                if "/" in t:
+                    # Slash-form ids are gone. Point at the dash form when it
+                    # exists, so the fix is one substitution and not a search.
+                    alt = "%s#%s" % (t.replace("/", "-"), sid)
+                    bad(d.rel, "L%d スラッシュ形式の参照は廃止: %s → %s" % (i, ref, alt)
+                        if alt in known_ids else
+                        "L%d 参照先が無い(スラッシュ形式は廃止): %s" % (i, ref))
+                elif t not in topic_names:
+                    # Used to be skipped outright, which meant a reference whose
+                    # whole TOPIC had gone away -- exactly what a rename breaks --
+                    # passed silently. Fenced lines stay exempt: they hold
+                    # transcripts and deliberate non-examples.
+                    if not d.fenced[i - 1]:
+                        bad(d.rel, "L%d 参照先の topic が無い: %s" % (i, ref))
+                elif ref not in known_ids:
+                    bad(d.rel, "L%d 参照先が無い: %s" % (i, ref))
+
+        # relative links. The previous reshape left 17 of these dangling and
+        # nothing noticed, so moving files is only mechanically safe with this.
+        for i, line in enumerate(d.lines, 1):
+            for m in LINK_RE.finditer(line):
+                target = m.group(1).split("#")[0]
+                if target and not (d.path.parent / target).exists():
+                    bad(d.rel, "L%d リンク先が無い: %s" % (i, m.group(1)))
+
+    cl = next((d for d in docs if d.ns == CHANGELOG_NS), None)
+    chunks = descendants_of(docs, CHANGELOG_NS)
+
+    # Entry rules over EVERY changelog file. Scoped to CHANGELOG.md alone, this
+    # stopped applying the moment the entries moved into chunks.
+    prev = None
+    labels = {}
+    for e in changelog_entries(docs):
+        if not ID_RE.search(e.doc.lines[e.start - 1]):
+            bad(e.doc.rel, "L%d エントリ '%s' に {#id} が無い" % (e.start, e.title[:40]))
+        label = e.title.split(" —")[0].split(" -")[0].strip()
+        if re.match(r"^\d{4}-\d{2}-\d{2}\(\d+\)$", label):
+            if label in labels:
+                bad(e.doc.rel, "L%d 日付ラベル '%s' が重複(%s と同じ)"
+                    % (e.start, label, labels[label]))
+            labels[label] = "%s:%d" % (e.doc.rel, e.start)
+        date = DATE_RE.match(e.title).group(1)
+        if prev and date < prev[0]:
+            bad(e.doc.rel, "L%d 日付が逆行(%s の後に %s) — チャンクの入れ違い"
+                % (e.start, prev[0], date))
+        prev = (date, e)
+
+    # Entries go in the newest chunk, not in the overview file.
+    for e in (cl.sections if cl else []):
+        if e.level == 2 and DATE_RE.match(e.title):
+            bad(cl.rel, "L%d エントリは最新チャンクへ書く: %s" % (e.start, e.title[:40]))
+
+    # Counts, date ranges and id lists are generated (`doc log --chunks`).
+    # Hand-written copies drifted apart in three places at once.
+    if cl:
+        for i, line in enumerate(cl.lines, 1):
+            if re.match(r"\s*\|\s*`?CHANGELOG[-/]\d", line):
+                bad(cl.rel, "L%d チャンク一覧は生成物。表を持たない(`doc log --chunks`)" % i)
+    for c in chunks:
+        if re.search(r"\d+\s*件", c.title):
+            bad(c.rel, "H1 に件数を書かない(生成物 — 必ず腐る)")
+        for i, line in enumerate(c.lines[:12], 1):
+            if line.startswith("収録エントリのid"):
+                bad(c.rel, "L%d 収録id一覧は生成物。`doc toc %s` で出る" % (i, c.topic))
+
+    if not problems:
+        note("doc check: 違反なし (%d ファイル)" % len(docs))
+        return 0
+    note("doc check: %d 件" % len(problems))
+    for p in problems:
+        out("  " + p)
+    return 1
+
+
+# --- helpers ----------------------------------------------------------------
+
+def section_at(doc, lineno):
+    best = None
+    for s in doc.sections:
+        if s.start <= lineno <= s.end:
+            if best is None or s.level > best.level:
+                best = s
+    return best
+
+
+def direct_children(docs, d):
+    """The ids of the topics one path segment below `d` -- what a reader should
+    see the moment they look at `d` itself (via `show`/`toc`), so nobody has to
+    hand-write "see also ..." prose in the body for this to be discoverable.
+    Grandchildren aren't listed: showing a child in turn reveals its own
+    children the same way."""
+    return [x.topic for x in children_of(docs, d.ns)]
+
+
+def resolve_docs(docs, names):
+    """By id first, then by path. A path is not a deprecated alias for an id --
+    it is a path, and `doc check`/`doc toc` print paths, so a reader who copies
+    one back has to get the file they were shown. The owned namespace resolves
+    too, which keeps `doc show CHANGELOG/006` working now that its id is
+    `CHANGELOG-006`."""
+    if not names:
+        return list(docs)
+    found = []
+    for n in names:
+        n = n.rstrip("/")
+        d = next((x for x in docs if x.topic == n), None)
+        if d is None:
+            d = next((x for x in docs if x.ns == n), None)
+        if d is None:
+            d = next((x for x in docs
+                      if x.rel in (n, n + ".md")
+                      or x.rel.endswith("/" + n) or x.rel.endswith("/" + n + ".md")), None)
+        if d is not None:
+            found.append(d)
+    return found
+
+
+def resolve_dir(docs, name):
+    """A folder with no README.md of its own owns no namespace and so has no id.
+    It is still worth listing on request, or its contents are unreachable
+    without knowing them already."""
+    name = name.rstrip("/")
+    if any(x.ns == name for x in docs):
+        return []
+    return children_of(docs, name)
+
+
+def topic_filter(docs, t):
+    """--topic is honestly just a substring filter: files under <t>/ plus
+    CHANGELOG entries whose text mentions <t>. No alias table (one would rot
+    silently and then lie)."""
+    tl = t.lower()
+    return [d for d in docs
+            if d.topic.lower() == tl or ("/" + tl + "/") in ("/" + d.rel.lower())
+            or d.ns == CHANGELOG_NS or d.ns.startswith(CHANGELOG_NS + "/")]
+
+
+USAGE = """doc -- プロジェクトドキュメントの索引と検索  (%s)
+
+  doc                          索引(探し方 + トップレベル文書の一覧)。まずこれ
+  doc full                     全文書を階層込みで一覧(人間が全体を俯瞰する用)
+  doc show <topic>#<節ID>...   その節だけ表示。`doc show <topic>` はファイル全体
+                                (子文書があれば一覧を添えて表示)
+  doc grep <パターン>          全文検索。見出し単位でヒット位置と行範囲を返す
+  doc log [<パターン>]         CHANGELOG のエントリ一覧(全チャンク横断、本文は show で)
+  doc toc [<topic>]            節ID・見出し・行範囲の一覧(子文書があれば併記)
+                                `doc toc <folder>/` は概要ファイルの無いフォルダの中身
+  doc check                    規約違反の検出
+
+共通: -F 固定文字列  -s 大小文字を区別  --root DIR
+show: --max-lines N (0=無制限, 既定 %d)
+grep: --topic T  --max-sections N  --per-section N  --width N  --files-only
+log : -n N (0=全件, 既定 %d)  --oldest-first  --chunks(チャンク別の件数と日付範囲)
+
+節IDは標準節(usage arch files security ops limits design)が暗黙、
+それ以外は見出し末尾の {#id}。行番号は編集でずれるので参照には使わない。
+topic id はパスの `/` を `-` にしたもの(`billing/design.md` → `billing-design`)。
+階層は id ではなくパスから決まるので、場所は `doc toc <topic>` の1行目で見る。
+"""
+
+
+def main(argv):
+    args = Args()
+    rest = args.parse(argv)
+    if args.help:
+        print(USAGE % (args.root or DEFAULT_ROOT, CAP_SHOW_LINES, CAP_LOG))
+        return 0
+    root = Path(args.root) if args.root else find_root()
+    if not root.is_dir():
+        warn("no such doc root: %s" % root)
+        return 2
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
+    cmd = "index"
+    if rest and not rest[0].startswith("-"):
+        if rest[0] in ("index", "full", "show", "grep", "log", "toc", "check"):
+            cmd = rest[0]
+            rest = rest[1:]
+        else:
+            warn("unknown subcommand: %s (doc --help)" % rest[0])
+            return 2
+    args.args = rest
+
+    docs = load_all(root)
+    if not docs:
+        warn("no *.md under %s" % root)
+        return 2
+    fn = {"index": cmd_index, "full": cmd_full, "show": cmd_show, "grep": cmd_grep,
+          "log": cmd_log, "toc": cmd_toc, "check": cmd_check}[cmd]
+    return fn(root, docs, args)
+
+
+class Args:
+    """Hand-rolled instead of argparse so the flags can appear anywhere and an
+    unknown flag is a clear error rather than a usage dump."""
+
+    def __init__(self):
+        self.help = False
+        self.fixed = False
+        self.case_sensitive = False
+        self.root = None
+        self.topic = None
+        self.n = CAP_LOG
+        self.max_lines = CAP_SHOW_LINES
+        self.max_sections = CAP_GREP_SECTIONS
+        self.per_section = CAP_GREP_PER_SECTION
+        self.width = GREP_WIDTH
+        self.depth = 0
+        self.oldest_first = False
+        self.chunks = False
+        self.files_only = False
+        self.args = []
+
+    def parse(self, argv):
+        rest, i = [], 0
+        ints = {"-n": "n", "--max-lines": "max_lines", "--max-sections": "max_sections",
+                "--per-section": "per_section", "--width": "width", "--depth": "depth"}
+        strs = {"--root": "root", "--topic": "topic"}
+        while i < len(argv):
+            a = argv[i]
+            if a in ("-h", "--help"):
+                self.help = True
+            elif a in ("-F", "--fixed"):
+                self.fixed = True
+            elif a in ("-s", "--case-sensitive"):
+                self.case_sensitive = True
+            elif a == "--oldest-first":
+                self.oldest_first = True
+            elif a == "--chunks":
+                self.chunks = True
+            elif a == "--files-only":
+                self.files_only = True
+            elif a in ints:
+                i += 1
+                setattr(self, ints[a], int(argv[i]))
+            elif a in strs:
+                i += 1
+                setattr(self, strs[a], argv[i])
+            elif a.startswith("-") and a != "-":
+                warn("unknown option: %s (doc --help)" % a)
+                sys.exit(2)
+            else:
+                rest.append(a)
+            i += 1
+        if self.max_sections == 0:
+            self.max_sections = 10 ** 6
+        return rest
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        os._exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
