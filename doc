@@ -31,13 +31,18 @@ encode a tree, hierarchy is derived from the path -- see ns_of().
 Sections are addressed by short id (`workspace#ops`), never by line number,
 because line numbers move when a file is edited. The seven standard section
 names map to fixed ids with no markup in the text; anything else carries an
-explicit `{#id}`.
+explicit id at the end of its heading: `<a id="id"></a>`, which GitHub keeps
+as a link target so `<file>.md#id` opens that section there too (`doc url`).
+The older `{#id}` form is still read; GitHub shows it as literal text, and
+`migrate-anchors` (beside this file) rewrites it.
 """
 import os
 import re
+import subprocess
 import sys
 import unicodedata
 from pathlib import Path
+from urllib.parse import quote
 
 # --- layout -----------------------------------------------------------------
 
@@ -81,7 +86,11 @@ CAP_GREP_SECTIONS = 20
 CAP_GREP_PER_SECTION = 3
 GREP_WIDTH = 200
 
-ID_RE = re.compile(r"\s*\{#([A-Za-z0-9][A-Za-z0-9._-]*)\}\s*$")
+# Explicit section id at the end of a heading. `<a id="x"></a>` is the current
+# form; `{#x}` is the older one, still read so a tree can be migrated whenever
+# (migrate-anchors). Use heading_id(), not group(1): the id is in one of two groups.
+_ID_CHARS = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+ID_RE = re.compile(r'\s*(?:<a\s+id="(%s)"\s*>\s*</a>|\{#(%s)\})\s*$' % (_ID_CHARS, _ID_CHARS))
 HEADING_RE = re.compile(r"^(#{1,6}) +(.*?)\s*$")
 FENCE_RE = re.compile(r"^\s*(?:```|~~~)")
 DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
@@ -95,6 +104,11 @@ LINK_RE = re.compile(r"\]\((\.{1,2}/[^)\s]+)\)")
 # shell parameter expansion in a recorded command ("${unit#chrome-debug@}")
 # reads as a reference to a topic named "unit".
 REF_RE = re.compile(r"(?<![\w/#.${-])([a-zA-Z][\w-]*(?:/[a-zA-Z0-9][\w-]*)*#[A-Za-z0-9][\w.-]*)")
+
+
+def heading_id(m):
+    """(id, form) from an ID_RE match; form is "a" or "brace"."""
+    return (m.group(1), "a") if m.group(1) else (m.group(2), "brace")
 
 
 def out(s=""):
@@ -113,13 +127,17 @@ def warn(s):
 # --- parsing ----------------------------------------------------------------
 
 class Section:
-    __slots__ = ("doc", "level", "title", "sid", "start", "end", "parent")
+    __slots__ = ("doc", "level", "title", "sid", "start", "end", "parent", "anchor")
 
-    def __init__(self, doc, level, title, sid, start):
+    def __init__(self, doc, level, title, sid, start, anchor=None):
         self.doc = doc
         self.level = level
         self.title = title
         self.sid = sid
+        # How the id is written in the heading: "a" (<a id>), "brace" ({#id}),
+        # or None (standard name / auto id). `doc url` needs it: only "a" is a
+        # link target on GitHub.
+        self.anchor = anchor
         self.start = start          # 1-based, the heading line itself
         self.end = start            # filled in later
         self.parent = None
@@ -142,7 +160,9 @@ class Section:
 class Doc:
     def __init__(self, root, path):
         self.path = path
-        self.rel = str(path.relative_to(root))
+        # as_posix(): ids and paths are built from "/"-separated rel paths;
+        # str() would give "\" on Windows (CHANGELOG\015#… not found).
+        self.rel = path.relative_to(root).as_posix()
         self.lines = path.read_text(encoding="utf-8", errors="replace").split("\n")
         while self.lines and self.lines[-1] == "":
             self.lines.pop()
@@ -164,7 +184,7 @@ class Doc:
     def _parse(self):
         in_fence = False
         fence_line = 0
-        heads = []  # (level, title, sid_explicit, lineno)
+        heads = []  # (level, title, sid_explicit, lineno, anchor form)
         for i, line in enumerate(self.lines, 1):
             if FENCE_RE.match(line):
                 if not in_fence:
@@ -183,12 +203,12 @@ class Doc:
                 continue
             level = len(m.group(1))
             title = m.group(2)
-            explicit = None
+            explicit = form = None
             mid = ID_RE.search(title)
             if mid:
-                explicit = mid.group(1)
+                explicit, form = heading_id(mid)
                 title = title[:mid.start()].rstrip()
-            heads.append((level, title, explicit, i))
+            heads.append((level, title, explicit, i, form))
 
         if in_fence:
             # Degraded output beats no output: rescan ignoring fences.
@@ -202,15 +222,15 @@ class Doc:
                 m = HEADING_RE.match(line)
                 if m and line[0] == "#":
                     title = m.group(2)
-                    explicit = None
+                    explicit = form = None
                     mid = ID_RE.search(title)
                     if mid:
-                        explicit = mid.group(1)
+                        explicit, form = heading_id(mid)
                         title = title[:mid.start()].rstrip()
-                    heads.append((len(m.group(1)), title, explicit, i))
+                    heads.append((len(m.group(1)), title, explicit, i, form))
 
         used = {}
-        for idx, (level, title, explicit, ln) in enumerate(heads):
+        for idx, (level, title, explicit, ln, form) in enumerate(heads):
             if level == 1 and not self.title:
                 self.title = title
                 continue
@@ -218,11 +238,11 @@ class Doc:
             if sid in used:
                 sid = uniq(sid, used)
             used[sid] = True
-            sec = Section(self, level, title, sid, ln)
+            sec = Section(self, level, title, sid, ln, form)
             # A section ends just before the next heading of its own level or
             # shallower; the last one ends at the file's last non-empty line.
             end = len(self.lines)
-            for l2, _t2, _e2, ln2 in heads[idx + 1:]:
+            for l2, _t2, _e2, ln2, _f2 in heads[idx + 1:]:
                 if l2 <= level:
                     end = ln2 - 1
                     break
@@ -387,7 +407,7 @@ def load_all(root):
             if d.topic in ("rules", "ForHuman", "CHANGELOG"):
                 continue
             d.topic = "%s-%s" % (name, d.topic.replace("/", "-"))
-            d.rel = str(d.path.relative_to(root.parent))
+            d.rel = d.path.relative_to(root.parent).as_posix()
             # ns was computed against the submodule's own root, so it no longer
             # describes where this doc sits in the tree being displayed. These
             # are presented flat, so make the namespace match the flat id.
@@ -686,12 +706,11 @@ def section_children(p):
     return [s for s in p.sections if s.parent is None]
 
 
-def cmd_show(root, docs, args):
-    if not args.args:
-        warn("usage: doc show <topic>#<id> | <topic> ...")
-        return 2
+def resolve_refs(docs, names):
+    """`topic#id` -> its Section, `topic` (or a path) -> its Doc. Returns
+    (picked, missing) in argument order."""
     picked, missing = [], []
-    for a in args.args:
+    for a in names:
         if "#" in a:
             t, sid = a.split("#", 1)
             d = next((x for x in docs if x.topic == t), None)
@@ -713,6 +732,14 @@ def cmd_show(root, docs, args):
             if not ds:
                 missing.append(a)
             picked.extend(ds)
+    return picked, missing
+
+
+def cmd_show(root, docs, args):
+    if not args.args:
+        warn("usage: doc show <topic>#<id> | <topic> ...")
+        return 2
+    picked, missing = resolve_refs(docs, args.args)
     for a in missing:
         warn("not found: %s" % a)
     if not picked:
@@ -822,6 +849,116 @@ def cmd_grep(root, docs, args):
     return 0
 
 
+# --- url: the same section on GitHub ------------------------------------------
+
+def github_slug(text):
+    """The anchor GitHub gives a heading on its own (github-slugger): the
+    heading's rendered text, lowercased, with punctuation and symbols dropped
+    and each space turned into '-'. Inline markup is reduced to its text first,
+    since GitHub slugs the rendered heading, not its source -- except inside a
+    code span, which renders as written (`port<N>` keeps its "n")."""
+    parts = re.split(r"(`+)(.*?)\1", text)
+    t = ""
+    for i in range(0, len(parts), 3):
+        prose = parts[i]
+        prose = re.sub(r"<[^>]*>", "", prose)                   # inline HTML, incl. <a id>
+        prose = re.sub(r"!?\[([^\]]*)\]\([^)]*\)", r"\1", prose)  # [text](url) -> text
+        prose = re.sub(r"\\(.)", r"\1", prose)                   # \* -> *
+        t += prose.replace("**", "").replace("*", "")
+        if i + 2 < len(parts):
+            t += parts[i + 2]
+    t = t.lower()
+    # Letters, marks, numbers and format chars stay (a ZWJ inside an emoji
+    # sequence survives on GitHub); other punctuation and symbols go.
+    t = "".join(c for c in t if c in " -_" or unicodedata.category(c)[0] in "LMN"
+                or unicodedata.category(c) == "Cf")
+    return t.replace(" ", "-")
+
+
+def github_anchors(doc):
+    """{heading line: GitHub's anchor for it}. GitHub numbers repeats (x, x-1,
+    x-2 ...) in file order, so every heading counts, the H1 included."""
+    seen, out_ = {}, {}
+    for i, line in enumerate(doc.lines, 1):
+        if doc.fenced[i - 1] or line[:1] != "#":
+            continue
+        m = HEADING_RE.match(line)
+        if not m:
+            continue
+        base = slug = github_slug(m.group(2))
+        while slug in seen:
+            seen[base] += 1
+            slug = "%s-%d" % (base, seen[base])
+        seen[slug] = 0
+        out_[i] = slug
+    return out_
+
+
+def git_out(cwd, *argv):
+    try:
+        r = subprocess.run(["git", "-C", str(cwd)] + list(argv),
+                           capture_output=True, text=True)
+    except OSError:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+GITHUB_REMOTE_RE = re.compile(
+    r"^(?:https?://(?:[^@/]+@)?github\.com/|git@github\.com:|ssh://git@github\.com/)"
+    r"([^/]+)/(.+?)(?:\.git)?/?$")
+
+
+def cmd_url(root, docs, args):
+    """GitHub URL of a topic or a section, for linking from issues and chat.
+    The file is the one in its OWN repository (an aggregated submodule's doc
+    links into that submodule's repo), at the remote's default branch unless
+    --ref / --commit say otherwise."""
+    if not args.args:
+        warn("usage: doc url <topic>#<id> | <topic> ... [--ref REF | --commit]")
+        return 2
+    picked, missing = resolve_refs(docs, args.args)
+    for a in missing:
+        warn("not found: %s" % a)
+    status = 1 if missing else 0
+    for p in picked:
+        doc = p.doc if isinstance(p, Section) else p
+        d = doc.path.parent
+        top = git_out(d, "rev-parse", "--show-toplevel")
+        remote = git_out(d, "remote", "get-url", "origin") if top else None
+        m = GITHUB_REMOTE_RE.match(remote or "")
+        if not m:
+            warn("%s: GitHub のリポジトリ内に無い(origin: %s)" % (doc.rel, remote or "なし"))
+            status = 1
+            continue
+        if args.commit:
+            ref = git_out(d, "rev-parse", "HEAD")
+            if not git_out(d, "branch", "-r", "--contains", "HEAD"):
+                warn("%s: HEAD がまだ push されていない -- このリンクは GitHub で 404 になる"
+                     % doc.rel)
+        elif args.ref:
+            ref = args.ref
+        else:
+            head = git_out(d, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+            ref = head.split("/", 1)[1] if head and "/" in head else "main"
+        path = doc.path.resolve().relative_to(Path(top).resolve()).as_posix()
+        if git_out(d, "status", "--porcelain", "--", str(doc.path)):
+            warn("%s: 未コミットの変更がある -- GitHub 上の内容は手元と違う" % doc.rel)
+        url = "https://github.com/%s/%s/blob/%s/%s" % (
+            m.group(1), m.group(2), quote(ref, safe="/"), quote(path, safe="/"))
+        if isinstance(p, Section):
+            if p.anchor == "a":
+                frag = p.sid
+            else:
+                frag = github_anchors(doc).get(p.start, p.sid)
+                if p.anchor == "brace":
+                    warn("%s: 旧書式 {#%s}。リンクは見出しの文言から GitHub が作るもので、"
+                         "見出しを変えると切れる(bin/migrate-anchors で <a id> に)"
+                         % (p.ref, p.sid))
+            url += "#" + quote(frag, safe="-_.")
+        out(url)
+    return status
+
+
 def cmd_check(root, docs, args):
     problems = []
 
@@ -879,7 +1016,7 @@ def cmd_check(root, docs, args):
         for s in d.sections:
             if s.level == 2 and s.sid not in STD_ORDER and not ID_RE.search(
                     d.lines[s.start - 1]) and not DATE_RE.match(s.title):
-                bad(d.rel, "L%d 節 '%s' に {#id} が無い(行番号でしか指せない)"
+                bad(d.rel, "L%d 節 '%s' に id(`<a id=\"…\"></a>`)が無い(行番号でしか指せない)"
                     % (s.start, s.title))
 
         # duplicate ids
@@ -942,7 +1079,7 @@ def cmd_check(root, docs, args):
     labels = {}
     for e in changelog_entries(docs):
         if not ID_RE.search(e.doc.lines[e.start - 1]):
-            bad(e.doc.rel, "L%d エントリ '%s' に {#id} が無い" % (e.start, e.title[:40]))
+            bad(e.doc.rel, "L%d エントリ '%s' に id(`<a id=\"…\"></a>`)が無い" % (e.start, e.title[:40]))
         label = e.title.split(" —")[0].split(" -")[0].strip()
         if re.match(r"^\d{4}-\d{2}-\d{2}\(\d+\)$", label):
             if label in labels:
@@ -1055,15 +1192,18 @@ USAGE = """doc -- プロジェクトドキュメントの索引と検索  (%s)
   doc log [<パターン>]         CHANGELOG のエントリ一覧(全チャンク横断、本文は show で)
   doc toc [<topic>]            節ID・見出し・行範囲の一覧(子文書があれば併記)
                                 `doc toc <folder>/` は概要ファイルの無いフォルダの中身
+  doc url <topic>[#<節ID>]...  GitHub 上のその文書・節の URL(Issue などからのリンク用)
   doc check                    規約違反の検出
 
 共通: -F 固定文字列  -s 大小文字を区別  --root DIR
 show: --max-lines N (0=無制限, 既定 %d)
 grep: --topic T  --max-sections N  --per-section N  --width N  --files-only
 log : -n N (0=全件, 既定 %d)  --oldest-first  --chunks(チャンク別の件数と日付範囲)
+url : --ref REF(既定は origin の既定ブランチ)  --commit(今の HEAD に固定したリンク)
 
 節IDは標準節(usage arch files security ops limits design)が暗黙、
-それ以外は見出し末尾の {#id}。行番号は編集でずれるので参照には使わない。
+それ以外は見出し末尾の <a id="id"></a>(旧書式 {#id} も読む)。
+行番号は編集でずれるので参照には使わない。
 topic id はパスの `/` を `-` にしたもの(`billing/design.md` → `billing-design`)。
 階層は id ではなくパスから決まるので、場所は `doc toc <topic>` の1行目で見る。
 """
@@ -1086,7 +1226,7 @@ def main(argv):
 
     cmd = "index"
     if rest and not rest[0].startswith("-"):
-        if rest[0] in ("index", "full", "show", "grep", "log", "toc", "check"):
+        if rest[0] in ("index", "full", "show", "grep", "log", "toc", "url", "check"):
             cmd = rest[0]
             rest = rest[1:]
         else:
@@ -1099,7 +1239,7 @@ def main(argv):
         warn("no *.md under %s" % root)
         return 2
     fn = {"index": cmd_index, "full": cmd_full, "show": cmd_show, "grep": cmd_grep,
-          "log": cmd_log, "toc": cmd_toc, "check": cmd_check}[cmd]
+          "log": cmd_log, "toc": cmd_toc, "url": cmd_url, "check": cmd_check}[cmd]
     return fn(root, docs, args)
 
 
@@ -1122,13 +1262,15 @@ class Args:
         self.oldest_first = False
         self.chunks = False
         self.files_only = False
+        self.ref = None
+        self.commit = False
         self.args = []
 
     def parse(self, argv):
         rest, i = [], 0
         ints = {"-n": "n", "--max-lines": "max_lines", "--max-sections": "max_sections",
                 "--per-section": "per_section", "--width": "width", "--depth": "depth"}
-        strs = {"--root": "root", "--topic": "topic"}
+        strs = {"--root": "root", "--topic": "topic", "--ref": "ref"}
         while i < len(argv):
             a = argv[i]
             if a in ("-h", "--help"):
@@ -1143,6 +1285,8 @@ class Args:
                 self.chunks = True
             elif a == "--files-only":
                 self.files_only = True
+            elif a == "--commit":
+                self.commit = True
             elif a in ints:
                 i += 1
                 setattr(self, ints[a], int(argv[i]))
