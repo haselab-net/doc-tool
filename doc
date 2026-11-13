@@ -365,7 +365,11 @@ def uniq(sid, used):
 def load(root):
     docs = []
     for p in sorted(root.rglob("*.md")):
-        if "bin" in p.relative_to(root).parts:
+        rel_parts = p.relative_to(root).parts
+        # Hidden folders are never documents: .git/, and e.g. a tree's
+        # .machines/<host>.md, one machine's own notes kept in a shared
+        # repository that must not show up on the other machines.
+        if "bin" in rel_parts or any(part.startswith(".") for part in rel_parts[:-1]):
             continue
         docs.append(Doc(root, p))
     return docs
